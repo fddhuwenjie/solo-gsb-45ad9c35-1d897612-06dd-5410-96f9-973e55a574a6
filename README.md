@@ -17,6 +17,13 @@
   文档和 `root` 引用，把 `document_id#/JSON/Pointer` 形式的 `$ref` 递归
   物化为单个 JSON；支持覆盖层合并、按完整引用链检测循环，并返回依赖顺序与
   叶子来源映射；输入文档不会被修改。
+- **持久会话与分批提交**：`POST /sessions` 按共同的初始文档（及初始版本向量）
+  创建会话并返回修订号 `0`；随后用 `POST /sessions/{id}/batches` 凭会话 ID 与
+  期望修订号分多次追加非空操作批次，`GET /sessions/{id}` 读取最新修订号、
+  重算文档、版本向量、冲突与墓碑。每次读取/提交都**从初始文档按原有合并规则
+  重放累计日志**（不把上次结果当作新基线），晚到的并发写仍参与原有裁决，
+  跨批因果引用可指向先前已存操作。会话落在 SQLite（`SESSION_DB_PATH`），
+  Docker Compose 以命名卷持久化，重启后仍可读取。
 
 ## 快速启动
 
@@ -568,13 +575,148 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 # => {"detail": "document 'b' not found (reference chain: a -> b#/y/z)"}
 ```
 
+## 持久会话：分批提交离线副本操作
+
+离线副本的操作日志经常**分多批到达**。会话把三方状态持久保存：共同的初始
+文档、初始版本向量，以及截至目前收到的全部操作日志。
+
+| 接口 | 作用 |
+| ---- | ---- |
+| `POST /sessions` | 以 `{document, version}` 创建会话，返回 `{session_id, revision: 0}` |
+| `POST /sessions/{id}/batches` | 提交 `{expected_revision, operations}`（批次非空），返回 `{session_id, revision, accepted, duplicates}` |
+| `GET /sessions/{id}` | 返回 `{session_id, revision, document, version, conflicts, tombstones}` |
+
+语义（与 `/merge`、`/apply` 使用同一套合并引擎）：
+
+- **始终从初始文档重算**：每次提交的校验与每次读取都按上面的合并规则重放
+  *累计日志*，从不把上次结果当作新基线。因此晚到的并发写即使落在后面的批次，
+  仍按 `(actor, seq)` 参与**原来的裁决与冲突统计**；后一批操作的 `version`
+  也可以引用先前批次中已经保存的操作（跨批因果）。
+- **幂等重传**：`(actor, seq)` 相同且内容一致的操作不重复保存，计入
+  `duplicates`；整批没有任何新操作时 `accepted` 为 0、**修订号不递增**。
+- **错误语义**：同 ID 内容不同、累计日志非法（缺口、因果引用缺失、版本向量
+  回退等）或操作执行失败一律 `422`；`expected_revision` 不等于当前修订号
+  （过旧或超前）返回 `409`；会话不存在返回 `404`。错误请求**不写入任何
+  部分批次**。
+- **原子并发提交**：修订号校验、去重、全量日志校验、重算与修订号提交在
+  同一个 SQLite 写事务中完成；两个同时提交同一修订号的请求只会有一个成功，
+  另一个得到 `409` 后可用新修订号重试。
+- **持久化**：数据保存在 SQLite（路径由 `SESSION_DB_PATH` 指定，默认
+  `data/sessions.db`）；Docker Compose 把 `/data` 挂为命名卷，
+  `docker compose restart`（甚至重建容器）后会话仍可读取、可继续提交。
+
+### 可执行的分批提交示例
+
+```bash
+# 1) 创建会话：共同初始文档 {"title": "draft"}，初始修订号为 0
+SID=$(curl -s -X POST localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"document": {"title": "draft"}, "version": {}}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["session_id"])')
+
+# 2) 第一批（期望修订号 0）：alice 修改 /title
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 0,
+    "operations": [
+      {"actor":"alice","seq":1,"version":{"alice":1},"path":"/title","action":"set","value":"alice-v"}
+    ]
+  }'
+# => {"session_id":"...","revision":1,"accepted":1,"duplicates":0}
+
+# 3) 第二批（期望修订号 1）：重传 alice:1（幂等跳过），并追加一条与
+#    alice:1 并发、但晚到的 bob:1 —— 它仍参与原有裁决，("bob",1) 胜出
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 1,
+    "operations": [
+      {"actor":"alice","seq":1,"version":{"alice":1},"path":"/title","action":"set","value":"alice-v"},
+      {"actor":"bob","seq":1,"version":{"bob":1},"path":"/title","action":"set","value":"bob-v"}
+    ]
+  }'
+# => {"session_id":"...","revision":2,"accepted":1,"duplicates":1}
+
+# 4) 读取会话：修订号、重算文档、版本向量、冲突、墓碑
+curl -s localhost:8000/sessions/$SID
+# => {"session_id":"...","revision":2,
+#     "document": {"title": "bob-v"},
+#     "version": {"alice": 1, "bob": 1},
+#     "conflicts": [{"path": "/title",
+#                    "reason": "concurrent writes; deterministic arbitration by (actor, seq)",
+#                    "winner": {"actor": "bob", "seq": 1, "action": "set", "value": "bob-v"},
+#                    "losers": [{"actor": "alice", "seq": 1, "action": "set", "value": "alice-v"}]}],
+#     "tombstones": []}
+```
+
+整批都是重传时修订号不变，可用原修订号继续；跨批因果引用由已存操作满足：
+
+```bash
+# 再来一批全是重传：accepted=0，revision 仍是 2
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 2,
+    "operations": [
+      {"actor":"alice","seq":1,"version":{"alice":1},"path":"/title","action":"set","value":"alice-v"}
+    ]
+  }'
+# => {"session_id":"...","revision":2,"accepted":0,"duplicates":1}
+
+# carol:1 的版本向量声明见过更早批次中的 alice:1 与 bob:1（跨批因果）
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 2,
+    "operations": [
+      {"actor":"carol","seq":1,"version":{"alice":1,"bob":1,"carol":1},"path":"/title","action":"delete"}
+    ]
+  }'
+# => {"session_id":"...","revision":3,"accepted":1,"duplicates":0}
+```
+
+错误示例（均不写入部分批次，修订号不变）：
+
+```bash
+# 过期（或超前）的期望修订号 -> 409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0,
+       "operations":[{"actor":"x","seq":1,"version":{"x":1},"path":"/x","action":"set","value":1}]}'
+# => 409
+# {"detail":"expected revision 0 but the session is at revision 3"}
+
+# 同一 (actor,seq) 内容不同 -> 422
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3,
+       "operations":[{"actor":"alice","seq":1,"version":{"alice":1},"path":"/title","action":"set","value":"CHANGED"}]}'
+# => 422 {"detail":"operation alice:1 appears twice with different payloads"}
+
+# 累计日志非法（声称见过不存在的 alice:9）-> 422，本批一条都不落库
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3,
+       "operations":[{"actor":"dan","seq":1,"version":{"alice":9,"dan":1},"path":"/w","action":"set","value":1}]}'
+# => 422 {"detail":"operation dan:1 depends on alice:9 which is not present ..."}
+```
+
+重启后继续：
+
+```bash
+docker compose restart            # 命名卷 /data 保留 SQLite 数据库
+curl -s localhost:8000/sessions/$SID   # 文档、修订号、冲突与墓碑依旧可读
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py      # FastAPI 路由：POST /merge、POST /apply、POST /route-changes、POST /query、POST /resolve、GET /healthz
+  main.py      # FastAPI 路由：POST /merge、POST /apply、POST /route-changes、POST /query、POST /resolve、POST /sessions、POST /sessions/{id}/batches、GET /sessions/{id}、GET /healthz
   models.py    # Pydantic 请求/响应模型
   engine.py    # 合并引擎：向量时钟、校验、因果排序、冲突检测、应用器
+  store.py     # 持久会话存储（SQLite）：原子分批提交、修订号乐观并发、全量重算
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
   query.py     # 受限 JSONPath 解析与求值（只读、单查询 10000 节点预算）
   resolve.py   # 跨文档 $ref 物化：覆盖层合并、引用链循环检测、叶子来源映射
@@ -584,8 +726,9 @@ tests/
   test_route_changes.py  # 30 个 route-changes 端到端测试
   test_query.py          # 73 个 /query 端到端测试
   test_resolve.py        # 37 个 /resolve 端到端测试
+  test_sessions.py       # 26 个持久会话/分批提交端到端测试（含并发原子性与重启持久化）
 conftest.py
 Dockerfile
-docker-compose.yml
+docker-compose.yml       # /data 命名卷持久化 SESSION_DB_PATH 下的 SQLite 数据库
 requirements.txt
 ```

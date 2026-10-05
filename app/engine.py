@@ -88,8 +88,12 @@ _MISSING = object()
 # log validation
 # ---------------------------------------------------------------------------
 
-def _canonical(op: Operation) -> str:
+def canonical_operation(op: Operation) -> str:
+    """Canonical JSON form deciding whether two op ids carry equal content."""
     return json.dumps(op.model_dump(mode="json"), sort_keys=True, default=str)
+
+
+_canonical = canonical_operation
 
 
 def validate_and_dedupe(

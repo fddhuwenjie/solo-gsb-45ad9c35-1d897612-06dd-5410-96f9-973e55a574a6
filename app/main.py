@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 from .engine import LogValidationError, merge_logs
 from .models import (
     ApplyRequest,
+    BatchSubmitRequest,
+    BatchSubmitResponse,
     MergeRequest,
     MergeResult,
     OperationId,
@@ -16,14 +18,18 @@ from .models import (
     ResolveResult,
     RouteChangesRequest,
     RouteChangesResult,
+    SessionCreateRequest,
+    SessionCreateResponse,
+    SessionView,
 )
 from .query import QueryValidationError, run_queries
 from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
+from .store import SessionNotFound, StaleRevision, get_store
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -114,3 +120,50 @@ def resolve_endpoint(req: ResolveRequest) -> dict:
         return resolve_documents(req.documents, req.root)
     except ResolveValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# durable offline sessions: batched operation-log delivery
+# ---------------------------------------------------------------------------
+
+
+@app.post("/sessions", response_model=SessionCreateResponse, status_code=201)
+def create_session(req: SessionCreateRequest) -> SessionCreateResponse:
+    """Create a session from a common initial document; revision starts at 0."""
+    try:
+        session_id, revision = get_store().create_session(
+            req.document, req.version
+        )
+    except LogValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return SessionCreateResponse(session_id=session_id, revision=revision)
+
+
+@app.post(
+    "/sessions/{session_id}/batches", response_model=BatchSubmitResponse
+)
+def submit_batch(
+    session_id: str, req: BatchSubmitRequest
+) -> BatchSubmitResponse:
+    """Append one non-empty batch against the expected current revision."""
+    try:
+        outcome = get_store().append_batch(
+            session_id, req.expected_revision, req.operations
+        )
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail="session not found") from exc
+    except StaleRevision as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LogValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return BatchSubmitResponse(session_id=session_id, **outcome)
+
+
+@app.get("/sessions/{session_id}", response_model=SessionView)
+def read_session(session_id: str) -> SessionView:
+    """Read revision, document, version vector, conflicts and tombstones."""
+    try:
+        state = get_store().get_session(session_id)
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail="session not found") from exc
+    return SessionView.model_validate(state)

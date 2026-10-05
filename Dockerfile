@@ -7,5 +7,10 @@ RUN pip install --no-cache-dir "fastapi>=0.110,<1.0" "uvicorn[standard]>=0.29" "
 
 COPY app ./app
 
+# Durable offline-session storage (SQLite); mount /data as a volume so
+# sessions survive `docker compose restart` / container recreation.
+ENV SESSION_DB_PATH=/data/sessions.db
+RUN mkdir -p /data
+
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

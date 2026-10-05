@@ -141,6 +141,58 @@ class MergeResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# durable offline sessions (batched log submission)
+# ---------------------------------------------------------------------------
+
+
+class SessionCreateRequest(BaseModel):
+    """Body of POST /sessions: the common initial document and vector."""
+
+    document: Any = None
+    version: dict[str, int] = Field(
+        default_factory=dict,
+        description="version vector of the common initial document",
+    )
+
+
+class SessionCreateResponse(BaseModel):
+    session_id: str
+    revision: int = 0
+
+
+class BatchSubmitRequest(BaseModel):
+    """Body of POST /sessions/{id}/batches: one non-empty batch of operations."""
+
+    expected_revision: int = Field(
+        ge=0,
+        description="revision the client observed before appending this batch",
+    )
+    operations: list[Operation] = Field(min_length=1)
+
+
+class BatchSubmitResponse(BaseModel):
+    session_id: str
+    revision: int
+    accepted: int = Field(
+        description="new (non-duplicate) operations appended by this batch"
+    )
+    duplicates: int = Field(
+        description="retransmitted same-id, same-content operations skipped"
+    )
+
+
+class SessionView(BaseModel):
+    """State of a session, recomputed from the initial document + full log."""
+
+    session_id: str
+    revision: int
+    document: Any = None
+    version: dict[str, int]
+    conflicts: list[Conflict]
+    tombstones: list[str]
+
+
+# ---------------------------------------------------------------------------
 # POST /route-changes
 # ---------------------------------------------------------------------------
 
