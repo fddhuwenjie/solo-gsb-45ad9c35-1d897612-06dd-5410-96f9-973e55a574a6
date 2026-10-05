@@ -1,12 +1,14 @@
 """FastAPI application exposing the offline JSON merge service."""
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .engine import LogValidationError, merge_logs
 from .models import (
     ApplyRequest,
+    BatchRequest,
+    BatchResponse,
     MergeRequest,
     MergeResult,
     OperationId,
@@ -16,24 +18,38 @@ from .models import (
     ResolveResult,
     RouteChangesRequest,
     RouteChangesResult,
+    SessionCreateRequest,
+    SessionCreateResponse,
+    SessionStateResponse,
 )
 from .query import QueryValidationError, run_queries
 from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
+from .sessions import RevisionConflictError, SessionNotFoundError, SessionStore
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
         "tombstones and stable array inserts, with optional pre-merge "
         "operation exclusion and replay-log export; snapshot diffing with "
         "wildcard subscriber routing (POST /route-changes); restricted "
-        "JSONPath querying (POST /query); and cross-document reference "
-        "resolution with overlays (POST /resolve)."
+        "JSONPath querying (POST /query); cross-document reference "
+        "resolution with overlays (POST /resolve); and durable "
+        "batched-submission sessions (POST /sessions, "
+        "POST /sessions/{session_id}/batches, GET /sessions/{session_id}) "
+        "that accumulate operation batches into one cumulative log "
+        "re-merged from the initial document on every commit."
     ),
 )
+
+app.state.session_store = SessionStore.from_env()
+
+
+def _session_store(request: Request) -> SessionStore:
+    return request.app.state.session_store
 
 
 @app.get("/healthz")
@@ -114,3 +130,53 @@ def resolve_endpoint(req: ResolveRequest) -> dict:
         return resolve_documents(req.documents, req.root)
     except ResolveValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# batched-submission sessions
+# ---------------------------------------------------------------------------
+
+
+@app.post("/sessions", response_model=SessionCreateResponse)
+def create_session(req: SessionCreateRequest, request: Request) -> dict:
+    """Create a session pinned to an initial document and version vector."""
+    store = _session_store(request)
+    try:
+        rec = store.create(req.document, req.version)
+    except LogValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"session_id": rec.session_id, "revision": rec.revision}
+
+
+@app.get("/sessions/{session_id}", response_model=SessionStateResponse)
+def get_session(session_id: str, request: Request) -> dict:
+    """Read the latest revision and the recomputed merge state of a session."""
+    try:
+        return _session_store(request).get_state(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+
+
+@app.post("/sessions/{session_id}/batches", response_model=BatchResponse)
+def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
+    """Atomically validate, recompute and commit one operation batch."""
+    try:
+        outcome = _session_store(request).submit_batch(
+            session_id, req.expected_revision, req.operations
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LogValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "session_id": outcome.session_id,
+        "revision": outcome.revision,
+        "accepted": outcome.accepted,
+        "duplicates": outcome.duplicates,
+    }

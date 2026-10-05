@@ -275,3 +275,65 @@ class ResolveResult(BaseModel):
     resolved: Any = None
     dependencies: list[str]
     sources: dict[str, str]
+
+
+# ---------------------------------------------------------------------------
+# POST /sessions -- durable batched operation submission
+# ---------------------------------------------------------------------------
+
+
+class SessionCreateRequest(BaseModel):
+    """Body of POST /sessions: the shared initial document and version.
+
+    The session pins both for its whole lifetime; every accepted batch is
+    re-merged from this initial state over the cumulative operation log.
+    """
+
+    document: Any = None
+    version: dict[str, int] = Field(
+        default_factory=dict,
+        description="version vector of the initial document",
+    )
+
+
+class SessionCreateResponse(BaseModel):
+    session_id: str
+    revision: int
+
+
+class BatchRequest(BaseModel):
+    """Body of POST /sessions/{session_id}/batches: one non-empty batch.
+
+    ``expected_revision`` must equal the session's current revision
+    (optimistic concurrency); the batch is validated, re-merged and
+    committed atomically -- a stale revision yields ``409`` and an invalid
+    batch ``422``, neither of which writes anything.
+    """
+
+    expected_revision: int = Field(ge=0)
+    operations: list[Operation] = Field(min_length=1)
+
+
+class BatchResponse(BaseModel):
+    session_id: str
+    revision: int = Field(
+        description=(
+            "latest revision after the commit; unchanged when the batch "
+            "contained no new operations"
+        )
+    )
+    accepted: int = Field(description="operations newly stored from this batch")
+    duplicates: int = Field(
+        description="retransmitted operations (same id, same content) skipped"
+    )
+
+
+class SessionStateResponse(BaseModel):
+    """Latest session state, recomputed from the initial document."""
+
+    session_id: str
+    revision: int
+    document: Any = None
+    version: dict[str, int]
+    conflicts: list[Conflict]
+    tombstones: list[str]
